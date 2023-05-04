@@ -1,19 +1,47 @@
+import os
+import sys
+sys.path.append(os.path.dirname(os.path.abspath(os.path.dirname(__file__))))
+
 import re
-import json
 import requests
 import pandas as pd
+from utils import *
 from itertools import chain
 from bs4 import BeautifulSoup
 from datetime import datetime, timedelta 
 
-class GetMovieInfoFromCrawling():
-    # refactoring : run_time 시에 template화 해야하는 코드
-    date = str(datetime.now() - timedelta(1))[:10].replace('-', '')
+from utils import *
+from airflow.models import BaseOperator
+from hook.movieAPI_hook import MovieAPIHook
+from airflow.utils.decorators import apply_defaults
+
+
+class GetMovieInfo(BaseOperator):
+ 
+    @apply_defaults
+    def __init__(self,**kwargs):
+        super.__init__(self, **kwargs)
+
+
+    def execute(self, context) : 
+        bucket = "boxoffice-bucket"
+        date = str(datetime.now() - timedelta(1))[:10].replace('-', '')
+        file_name = "info-" + date
+        movie_api_key = get_API_key("MOVIE_API_KEY")
+        hook = MovieAPIHook(movie_api_key)
+        df = hook.get_movie_info_df()
+        df_news = self.news_crawler(df)
+        df_star = self.star_crawler(df)
+        df = pd.merge(df, df_news, how = 'left', on = 'movieCd')
+        df = pd.merge(df, df_star, how = 'left', on = 'movieCd')
+        df = self.extract_value(df)
+        df = self.pre_nation(df)
+        result = df.to_csv()
+        success = upload_file_s3(bucket, "info/" + file_name + '.csv', result)
+        if not success : raise Exception("There was a problem uploading movie info.") 
     
-    def __init__(self,):
-        movie_API_key = ""
-    
-    def news_crawler(df):
+
+    def news_crawler(self, df):
         news_list = []
         movieCd_list = df['movieCd'].to_list()
         movie_list = df['movieNm'].to_list()
@@ -50,40 +78,40 @@ class GetMovieInfoFromCrawling():
         news_df['뉴스 언급 건수'] = news_df['뉴스 언급 건수'].astype(int)
         return news_df
 
-def star_crawler(df):
-    star_list = []
-    
-    movieCd_list = df['movieCd'].to_list()
-    movie_list = df['movieNm'].to_list()
-    keyword_list = [re.sub('[-=+,#/\?:^$.@*\"※~&%ㆍ!』\\‘|\(\)\[\]\<\>`\'…》]',' ', movie) for movie in movie_list]
-    
-    df['openDt_c'] = pd.to_datetime(df['openDt'], format = '%Y%M%d')
-    df['startDt'] = df['openDt_c']- timedelta(days=15)
-    df['endDt'] = df['openDt_c'] + timedelta(days=15)
-    
-    for i in range(len(df)):
-        movieCd = str(movieCd_list[i])
-        keyword = str(keyword_list[i])
-        url = f"https://movie.naver.com/movie/search/result.naver?query={keyword}&section=all&ie=utf8"
-        response = requests.get(url)
-        if response.status_code == 200:
-            soup = BeautifulSoup(response.text,"html.parser")
-            star =  soup.select('#old_content > ul.search_list_1 > li > dl > dd.point > em.num')
-            if(len(star)>0):
-                star = star[0].text
-                star_list.append([movieCd, star])
-            else: 
-                star_list.append([movieCd, 0])
-                    
+    def star_crawler(self, df):
+        star_list = []
         
-        else:
-            print(response.status_code)
-                
-        star_df = pd.DataFrame(star_list, columns = ["movieCd", "평점"])
-        star_df['평점'] = star_df['평점'].astype(float)
-        return star_df
+        movieCd_list = df['movieCd'].to_list()
+        movie_list = df['movieNm'].to_list()
+        keyword_list = [re.sub('[-=+,#/\?:^$.@*\"※~&%ㆍ!』\\‘|\(\)\[\]\<\>`\'…》]',' ', movie) for movie in movie_list]
+        
+        df['openDt_c'] = pd.to_datetime(df['openDt'], format = '%Y%M%d')
+        df['startDt'] = df['openDt_c']- timedelta(days=15)
+        df['endDt'] = df['openDt_c'] + timedelta(days=15)
+        
+        for i in range(len(df)):
+            movieCd = str(movieCd_list[i])
+            keyword = str(keyword_list[i])
+            url = f"https://movie.naver.com/movie/search/result.naver?query={keyword}&section=all&ie=utf8"
+            response = requests.get(url)
+            if response.status_code == 200:
+                soup = BeautifulSoup(response.text,"html.parser")
+                star =  soup.select('#old_content > ul.search_list_1 > li > dl > dd.point > em.num')
+                if(len(star)>0):
+                    star = star[0].text
+                    star_list.append([movieCd, star])
+                else: 
+                    star_list.append([movieCd, 0])
+                        
+            
+            else:
+                print(response.status_code)
+                    
+            star_df = pd.DataFrame(star_list, columns = ["movieCd", "평점"])
+            star_df['평점'] = star_df['평점'].astype(float)
+            return star_df
 
-    def extract_value(trial):
+    def extract_value(self, trial):
         # 장르, 등급, 감독, 국적 추출
         genre = []
         audit = []
@@ -124,15 +152,6 @@ def star_crawler(df):
         return(trial)
     
 
-    def pre_nation(df):
+    def pre_nation(self, df):
         df.loc[(df['국적'] != '한국')*(df['국적']!='미국'), '국적'] = '한국미국제외'
         return df
-
-
-    def upload_file_s3(bucket,filename, content):
-        client = boto3.client('s3')
-        try :
-            client.put_object(Bucket=bucket, Key=filename, Body=content)
-            return True
-        except :
-            return False
